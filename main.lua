@@ -17,6 +17,7 @@ log.setLevel("INFO")
 errDump.config(true,0)
 
 require "user"
+require "ble_server"
 
 -- 用户代码已结束---------------------------------------------
 -- 结尾总是这一句

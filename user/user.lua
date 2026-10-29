@@ -468,6 +468,8 @@ local function flags_reset(type,order,flag)
 end
 sys.subscribe("Flags_Reset", flags_reset)
 
+--拍拍换电：逻辑为收到拍拍信号，向服务器发送9e 2c ffffff 00 01 01 fff 33请求换电，等待服务器下发0x006换电业务指令
+--该函数功能为接收拍拍信号，收到信号向服务器发送请求换电的指令
 local function pp_signal_poll()
     local stable_level = 1
     local candidate_level = stable_level
