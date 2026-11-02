@@ -52,7 +52,8 @@ CLASS.EndChBat = 0x29 -- 强制结束当前充电入仓
 CLASS.QuBat = 0x2A -- 取电
 CLASS.QuBatRes = 0x2B -- 取电结果
 --CLASS.Unusual = 0x00 -- 异常上报
-CLASS.PpRes = 0x2C -- 拍拍换电
+CLASS.PpRes = 0x35 -- 拍拍换电请求/应答
+CLASS.PpExBatRes = 0x36 -- 拍拍换电结果
 
 
 --- 帧类型
@@ -127,6 +128,7 @@ tcp_net.Active.GPSUp = 0x10 -- GPS
 tcp_net.Active.Alarm = 0x11 -- 报警上报
 tcp_net.Active.UpdateRes = 0x14 -- 升级结果
 tcp_net.Active.ExBatRes = 0x16 -- 换电结果
+tcp_net.Active.PpExBatRes = 0x36 -- 拍拍换电结果
 tcp_net.Active.BoxVer = 0x18 -- 上传仓控版本
 tcp_net.Active.CmdBack = 0xAA -- 返回应用端操作指令
 tcp_net.Active.Abnor = 0x1E -- 异常上报
@@ -140,8 +142,13 @@ tcp_net.Active.Unusual = 0x00 -- 故障上报
 tcp_net.Net_Flag = false
 
 local serialize_send
-function tcp_net.pp_request()
-    serialize_send(CLASS.PpRes, 0, TYPE.Cmd, 1, {0x01})
+function tcp_net.pp_request(order, bt)
+    if not order or not bt then return false end
+    local payload = {}
+    for i = 1, #bt do payload[#payload + 1] = string.byte(bt, i) end
+    payload[#payload + 1] = order
+    serialize_send(CLASS.PpRes, 0, TYPE.Cmd, #payload, payload)
+    return true
 end
 --
 local Device_id = attr.setup_get("Device_ID")
@@ -551,6 +558,19 @@ local function bat_result_up(class,result,num,order)
     serialize_send(class, order,TYPE.Cmd,#payload, payload)
     return true
 end
+
+local function pp_result_up(result)
+    local info = attr.exbat_info_get()
+    if not info.orderget or not info.ordergive or not info.btget or not info.btgive or not info.number then return false end
+    local payload = {info.orderget}
+    for i = 1, 26 do payload[#payload + 1] = string.byte(info.btget, i) or 0xFF end
+    payload[#payload + 1] = info.ordergive
+    for i = 1, 26 do payload[#payload + 1] = string.byte(info.btgive, i) or 0xFF end
+    payload[#payload + 1] = result
+    for i = 1, #info.number do payload[#payload + 1] = string.byte(info.number, i) end
+    serialize_send(CLASS.PpExBatRes, 0, TYPE.Cmd, #payload, payload)
+    return true
+end
 --
 -- 
 --报警控制状态上报
@@ -690,7 +710,7 @@ local class_process_tbl = {
 
                     if 0 < order_get and order_get<= attr.setup_get("BOXES") and 0 < order_give and  order_give<= attr.setup_get("BOXES") and 
                             string.sub(bt_get_str,1,2)== "BT" and string.sub(bt_give_str,1,2)== "BT" then
-                        if not attr.Exbat_State and attr.Update_Box == 0 and attr.Update_State == 0 and not attr.Rebat_State and not attr.Chbat_State and not attr.Qubat_State then
+                        if not attr.Exbat_State and not attr.Pp_State and attr.Update_Box == 0 and attr.Update_State == 0 and not attr.Rebat_State and not attr.Chbat_State and not attr.Qubat_State then
                             print("[EX_BAT]","收到换电指令")
                             sys.publish("Flags_Reset", 1,order_get,false)
                             attr.exbat_info_set(true,order_get,bt_get_str,order_give,bt_give_str,num_str,is_lock)
@@ -739,6 +759,78 @@ local class_process_tbl = {
                 print("[EX_BAT]","换电数据",give_index,order_get,#bt_get_str,bt_get_str,order_give,#bt_give_str,bt_give_str,num_str,is_lock)
             end 
         end
+    end,
+    [tostring(CLASS.PpRes)] = function(type, order, payload)
+        if type ~= TYPE.Cmd then return end
+        sys.publish("UP_IND_S", tcp_net.Active.CmdBack, order, payload, CLASS.PpRes)
+        class_ack_send(CLASS.PpRes, order)
+
+        local boxes = attr.setup_get("BOXES") or 0
+        local bt_get = attr.Pp_BT
+        if not attr.Pp_State or not attr.Pp_Order or not bt_get then
+            print("[PP_EX_BAT]", "收到拍拍换电应答，但当前没有待处理请求")
+            return
+        end
+
+        if #payload == 1 and payload[1] == 0 then
+            print("[PP_EX_BAT]", "服务器判定套餐过期，不允许换电")
+            sys.publish("Pp_Exchange_Result", false, "套餐已过期")
+            return
+        end
+
+        local str_all = string.char(unpack(payload))
+        local bt_get_len = #bt_get
+        if #payload < bt_get_len + 2 then
+            print("[PP_EX_BAT]", "拍拍换电应答字段过短", #payload)
+            return
+        end
+        local order_get = payload[1]
+        local bt_get_reply = string.sub(str_all, 2, bt_get_len + 1)
+        local order_give = payload[bt_get_len + 2]
+        local give_index = string.find(str_all, "BT", bt_get_len + 3, true)
+        if not give_index then
+            if payload[bt_get_len + 3] == 0 then
+                print("[PP_EX_BAT]", "服务器返回套餐过期标志")
+                sys.publish("Pp_Exchange_Result", false, "套餐已过期")
+                return
+            end
+            print("[PP_EX_BAT]", "拍拍换电应答缺少释放电池BT码", #payload)
+            return
+        end
+
+        local number_start = #payload - 20
+        local bt_end = number_start - 1
+        local expired = payload[give_index - 1] == 0
+        if payload[bt_end] == 0 then
+            expired = true
+            bt_end = bt_end - 1
+        end
+        local bt_give_len = bt_end - give_index + 1
+        local bt_give = string.sub(str_all, give_index, give_index + bt_give_len - 1)
+        local number = string.sub(str_all, number_start)
+
+        if expired then
+            print("[PP_EX_BAT]", "服务器返回套餐过期标志")
+            sys.publish("Pp_Exchange_Result", false, "套餐已过期")
+            return
+        end
+        if (bt_give_len ~= 24 and bt_give_len ~= 26) or not order_give
+            or order_get ~= attr.Pp_Order or bt_get_reply ~= bt_get or order_give < 1 or order_give > boxes
+            or string.sub(bt_give, 1, 2) ~= "BT" or #number ~= 21 then
+            print("[PP_EX_BAT]", "拍拍换电应答字段校验失败", order_get, attr.Pp_Order, order_give, #bt_give, #number)
+            return
+        end
+
+        print("[PP_EX_BAT]", "收到拍拍换电订单", order_get, order_give, number)
+        attr.exbat_info_set(true, order_get, bt_get, order_give, bt_give, number, 0)
+        attr.Pp_Direct = true
+        attr.Pp_State = false
+        attr.Pp_Order = nil
+        attr.Pp_BT = nil
+        sys.publish("Pp_Exchange_Result", true)
+        sys.publish("Flags_Reset", 1, order_get, false)
+        attr.End_Exbat = false
+        sys.publish("Exchanging")
     end,
     [tostring(CLASS.DeviceInfo)] = function(type, order, payload)
         if type == TYPE.Ack then
@@ -961,6 +1053,11 @@ local class_process_tbl = {
             else
                 sys.publish("Exbat_Ack", 0x01)
             end
+        end
+    end,
+    [tostring(CLASS.PpExBatRes)] = function(type, order, payload)
+        if type == TYPE.Ack then
+            sys.publish("PpExbat_Ack", #payload == 0 and 0x00 or 0x01)
         end
     end,
     [tostring(CLASS.BatOKReq)] = function(type,order, payload)
@@ -1735,6 +1832,8 @@ local batOKreq_up_flag = true
 local exbat_up_flag = false
 local exbat_res_code = nil
 local exbat_res_num = nil
+local pp_exbat_up_flag = false
+local pp_exbat_res_code = nil
 local rebat_up_flag = false
 local rebat_res_code = nil
 local rebat_res_num = nil
@@ -1770,6 +1869,11 @@ local function upload_indicate(flag, order, result)
         if #alarm_list > 64 then table.remove(alarm_list, 1) end
         table.insert(alarm_list, alarm)
     elseif flag == tcp_net.Active.ExBatRes then
+        if attr.Pp_Direct then
+            pp_exbat_up_flag = true
+            pp_exbat_res_code = result
+            return
+        end
         if result == 7 or result == 8 or result == 0x0C or result == 0x0E or result == 0x0F or result == 0x11 or result == 0x12 then
             if exbat_up_flag and exbat_res_code ~= 7 and exbat_res_code ~= 8 and exbat_res_code ~= 0x0C and exbat_res_code ~= 0x0E 
                 and exbat_res_code ~= 0x0F and exbat_res_code ~= 0x11 and exbat_res_code ~= 0x12 then 
@@ -2011,6 +2115,20 @@ local function poll_task()
                 end
 
                 -- * 换电结果上报处理
+                if pp_exbat_up_flag then
+                    if pp_result_up(pp_exbat_res_code) then
+                        pp_exbat_up_flag = false
+                        local result, reply = sys.waitUntil("PpExbat_Ack", 5000)
+                        if result and reply == 0x00 then
+                            print("[TCP-NET]", "pp exchange result upload succeed")
+                            pp_exbat_res_code = nil
+                            attr.Pp_Direct = false
+                            attr.exbat_info_set(false,nil,nil,nil,nil,nil)
+                        else
+                            pp_exbat_up_flag = true
+                        end
+                    end
+                end
                 if exbat_up_flag then
                     if bat_result_up(CLASS.ExBatRes,exbat_res_code,exbat_res_num,0) then
                         exbat_up_flag = false

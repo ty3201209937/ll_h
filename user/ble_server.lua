@@ -10,11 +10,11 @@ function ble_server_receiver.proc(service_uuid, char_uuid, data)
         if data and data.toStr then
             data = data:toStr()
         else
-            log.warn("ble_server_receiver", "写入数据类型不支持", type(data))
+            print("[BLE]", "写入数据类型不支持", type(data))
             return
         end
     end
-    log.info("ble_server_receiver", "收到写入数据", service_uuid, char_uuid, data:toHex())
+    print("[BLE]", "收到写入数据", service_uuid, char_uuid, data:toHex())
 
     sys.publish("RECV_BLE_WRITE_DATA", service_uuid, char_uuid, data)
 end
@@ -79,6 +79,7 @@ local function ble_server_sender_task_func()
             if item.wait_ack then
                 ack_expected = {command = item.data:byte(2), door = item.data:byte(9)}
                 ack_received = nil
+                print("[BLE]", "发送状态包，等待回传", ack_expected.command, ack_expected.door, #item.data)
             end
             for offset = 1, #item.data, 20 do
                 if not transport_connected then ok = false; break end
@@ -96,13 +97,16 @@ local function ble_server_sender_task_func()
                 if ack_received then
                     result, command, door, ack = true, ack_received.command, ack_received.door, ack_received.result
                 else
-                    result, command, door, ack = sys.waitUntil("BLE_PACKET_ACK", 5000)
+                    result, command, door, ack = sys.waitUntil("BLE_PACKET_ACK", 10000)
                 end
                 ack_expected = nil
                 ack_received = nil
-                if not result or command ~= item.data:byte(2) or door ~= item.data:byte(9) or ack ~= 0 then
+                if not result or command ~= item.data:byte(2)
+                    or (door ~= 0 and door ~= 0xFF and door ~= item.data:byte(9)) or ack ~= 0 then
                     ok = false
-                    log.warn("ble_server", "等待蓝牙协议回传超时或回传失败", item.data:byte(2), item.data:byte(9))
+                    print("[BLE]", "等待蓝牙协议回传超时或回传失败", item.data:byte(2), item.data:byte(9))
+                else
+                    print("[BLE]", "收到状态包回传", command, door, ack)
                 end
             end
             send_item_cbfunc(item, ok)
@@ -113,7 +117,7 @@ local function ble_server_sender_task_func()
                 ack_expected = nil
                 ack_received = nil
                 sys.publish("BLE_SEND_FAILED")
-                log.warn("ble_server", "发送失败，请手机开启EA01通知后重新发送连接报文")
+                print("[BLE]", "发送失败，请手机开启EA01通知后重新发送连接报文")
                 send_queue = {}
                 break
             end
@@ -133,7 +137,7 @@ local TASK_NAME = ble_server_sender.TASK_NAME_PREFIX.."main"
 
 -- 配置参数
 local config = {
-    device_name = "LuatOS",          -- 设备名称
+    device_name = "208820882721",          -- 设备名称
     service_uuid = "FA00",           -- 服务UUID
     char_uuid1 = "EA01",             -- Characteristic 1
     char_uuid2 = "EA02",             -- Characteristic 2
@@ -178,11 +182,35 @@ end
 
 local status_send_active = false
 local status_packets_pending = 0
+local ble_exchange_active = false
+local ble_exchange_order = nil
+
 local function ble_send_packet(command, door, payload)
     if not status_send_active then return end
     sys.publish("SEND_DATA_REQ", "cabinet_status", config.service_uuid, config.char_uuid1,
         ble_packet(command, door, 0x01, payload, 0x5C, 0x5C), "notify", nil, true)
 end
+
+local function ble_exchange_ack()
+    sys.publish("SEND_DATA_REQ", "ble_exchange_ack", config.service_uuid, config.char_uuid1,
+        ble_packet(0x06, 0xFF, 0x02, {0x00}, 0x5C, 0x5C), "notify")
+end
+
+local function ble_exchange_result(order, result)
+    if not ble_exchange_active or tostring(order) ~= tostring(ble_exchange_order) then return end
+    local payload = {result or 0x01}
+    local number = tostring(order or "")
+    for i = 1, 27 do payload[#payload + 1] = number:byte(i) or 0x00 end
+    sys.publish("SEND_DATA_REQ", "ble_exchange_result", config.service_uuid, config.char_uuid1,
+        ble_packet(0x16, 0xFF, 0x01, payload, 0x5C, 0x5C), "notify")
+    print("[BLE]", "发送蓝牙换电结果", result or 0x01, number)
+    ble_exchange_active = false
+    ble_exchange_order = nil
+end
+
+sys.subscribe("UP_IND_S", function(command, order, result)
+    if command == 0x16 then ble_exchange_result(order, result) end
+end)
 
 local function ble_send_status()
     local cabinet = {}
@@ -198,6 +226,7 @@ local function ble_send_status()
     ble_send_packet(0x01, 0x00, cabinet)
 
     local boxes = math.min(attr.setup_get("BOXES") or 0, 15)
+    -- 先发送全部仓门状态，避免某个电池包未回 ACK 阻塞后续仓门状态。
     for i = 1, boxes do
         local box = {
             attr.Box_Lock[i] or 0xFF,
@@ -211,7 +240,10 @@ local function ble_send_status()
         box[8] = attr.box_banned_get(i) == 1 and 1 or 0
         box[9] = attr.box_abnor_get(i) == 1 and 1 or 0
         ble_send_packet(0x02, i, box)
+    end
 
+    -- 仓门状态全部发送完成后，再发送电池状态。
+    for i = 1, boxes do
         local battery = {}
         local bt = attr.bat_BT_get(i)
         if bt and (#bt == 26 or #bt == 24) then
@@ -237,43 +269,92 @@ end
 
 local receive_buffer = ""
 local session_ready = false
+
+local function ble_handle_exchange(payload)
+    -- 回收仓(1)+回收BT(17)+释放仓(1)+释放BT(17)+订单号(27)+锁仓(1)。
+    if #payload ~= 64 and #payload ~= 65 then
+        print("[BLE]", "蓝牙换电数据长度错误", #payload)
+        return
+    end
+    print("[BLE]", "开始进入换电流程")
+    local order_get, order_give = payload[1], payload[19]
+    local bt_get = string.char(unpack(payload, 2, 18))
+    local bt_give = string.char(unpack(payload, 20, 36))
+    local number = string.char(unpack(payload, 37, 63))
+    local lock = payload[64] or 0
+    local boxes = attr.setup_get("BOXES") or 0
+    if order_get < 1 or order_get > boxes or order_give < 1 or order_give > boxes
+        or bt_get:sub(1, 2) ~= "BT" or bt_give:sub(1, 2) ~= "BT" then
+        print("[BLE]", "蓝牙换电字段校验失败", order_get, order_give, #bt_get, #bt_give)
+        return
+    end
+    if attr.Exbat_State or attr.Pp_State or attr.Update_Box ~= 0 or attr.Update_State ~= 0
+        or attr.Rebat_State or attr.Chbat_State or attr.Qubat_State then
+        print("[BLE]", "当前业务占用，拒绝蓝牙换电", number)
+        return
+    end
+    ble_exchange_active = true
+    ble_exchange_order = number
+    sys.publish("Flags_Reset", 1, order_get, false)
+    attr.exbat_info_set(true, order_get, bt_get, order_give, bt_give, number, lock)
+    attr.End_Exbat = false
+    print("[BLE]", "收到蓝牙换电指令", order_get, order_give, number)
+    sys.publish("Exchanging")
+end
+
 sys.subscribe("BLE_SEND_FAILED", function()
     session_ready = false
     status_send_active = false
     status_packets_pending = 0
     ack_received = nil
+    ble_exchange_active = false
+    ble_exchange_order = nil
 end)
 
 local function ble_handle_frame(frame)
     local bytes = {string.byte(frame, 1, #frame)}
     local body = frame:sub(1, -4)
     local received = bytes[#bytes - 2] + bytes[#bytes - 1] * 256
+    print("[BLE]", "CRC",received)
     if crypto.crc16_modbus(body) ~= received then
-        log.warn("ble_server", "报文CRC错误")
+        print("[BLE]", "报文CRC错误")
         return
     end
     local address = string.char(unpack(ble_address()))
     local target = frame:sub(3, 8)
     if target ~= address and target ~= string.rep(string.char(0xFF), 6) then
-        log.warn("ble_server", "连接报文地址不匹配", target:toHex(), address:toHex())
+        print("[BLE]", "连接报文地址不匹配", target:toHex(), address:toHex())
         return
     end
     if #bytes == 15 and bytes[10] == 0x02 and bytes[11] == 0x01 then
         local ack = bytes[12]
-        if ack_expected and bytes[2] == ack_expected.command and bytes[9] == ack_expected.door then
+        print("[BLE]", "收到协议回传", bytes[2], bytes[9], ack)
+        if ack_expected and bytes[2] == ack_expected.command
+            and (bytes[9] == 0 or bytes[9] == 0xFF or bytes[9] == ack_expected.door) then
             ack_received = {command = bytes[2], door = bytes[9], result = ack}
             sys.publish("BLE_PACKET_ACK", bytes[2], bytes[9], ack)
+        elseif ack_expected then
+            print("[BLE]", "忽略不匹配回传，期望指令/仓号", ack_expected.command, ack_expected.door,
+                "实际指令/仓号", bytes[2], bytes[9])
         end
+        return
+    end
+    if bytes[2] == 0x06 then
+        print("[BLE]", "收到指令")
+        ble_exchange_ack()
+        local payload = {}
+        for i = 1, bytes[11] do payload[i] = bytes[11 + i] end
+        ble_handle_exchange(payload)
         return
     end
     if #bytes ~= 15 or bytes[2] ~= 0x00 or bytes[9] ~= 0x00
         or bytes[10] ~= 0x01 or bytes[11] ~= 0x01 or bytes[12] ~= 0x01 then
-        log.warn("ble_server", "收到非连接请求报文", frame:toHex())
+        print("[BLE]", "收到非连接请求报文", frame:toHex())
         return
     end
     if session_ready then return end
     session_ready = true
-    log.info("ble_server", "连接报文校验通过，回传后上报整柜状态")
+    print("[BLE]", "连接报文校验通过，回传后上报整柜状态")
     sys.publish("SEND_DATA_REQ", "connect_ack", config.service_uuid, config.char_uuid1,
         ble_packet(0x00, 0x00, 0x02, {0x01}, 0x5C, 0x5C), "notify",
         {func = function(ok)
@@ -289,9 +370,9 @@ end
 
 local function ble_connection_request(service_uuid, char_uuid, data)
     if not transport_connected then return end
-    log.info("ble_server", "手机写入", service_uuid, char_uuid, data:toHex())
+    print("[BLE]", "手机写入", service_uuid, char_uuid, data:toHex())
     if service_uuid ~= config.service_uuid then
-        log.warn("ble_server", "手机写入的服务UUID不匹配", service_uuid)
+        print("[BLE]", "手机写入的服务UUID不匹配", service_uuid)
         return
     end
     receive_buffer = receive_buffer .. data
@@ -303,7 +384,7 @@ local function ble_connection_request(service_uuid, char_uuid, data)
         local length = receive_buffer:byte(11) + 14
         if #receive_buffer < length then return end
         if receive_buffer:byte(length) == 0x4D then
-            log.info("ble_server", "收到完整手机报文", receive_buffer:sub(1, length):toHex())
+            print("[BLE]", "收到完整手机报文", receive_buffer:sub(1, length):toHex())
             ble_handle_frame(receive_buffer:sub(1, length))
             receive_buffer = receive_buffer:sub(length + 1)
         else
@@ -347,19 +428,23 @@ local att_db = {
 local function ble_event_cb(ble_device, ble_event, ble_param)
     -- 连接中心设备成功
     if ble_event == ble.EVENT_CONN then
-        log.info("BLE", "BLE物理连接成功")
+        print("[BLE]", "BLE物理连接成功")
         transport_connected = true
         receive_buffer = ""
         session_ready = false
+        ble_exchange_active = false
+        ble_exchange_order = nil
         ack_expected = nil
         ack_received = nil
         sysmsg.sendMsg(TASK_NAME, "BLE_EVENT", "CONNECT", ble_param)
     -- 连接断开
     elseif ble_event == ble.EVENT_DISCONN then
-        log.warn("BLE", "BLE连接断开", ble_param and ble_param.reason)
+        print("[BLE]", "BLE连接断开", ble_param and ble_param.reason)
         transport_connected = false
         receive_buffer = ""
         session_ready = false
+        ble_exchange_active = false
+        ble_exchange_order = nil
         ack_expected = nil
         ack_received = nil
         send_queue = {}
@@ -367,36 +452,36 @@ local function ble_event_cb(ble_device, ble_event, ble_param)
 
     -- 收到中心设备的写请求
     elseif ble_event == ble.EVENT_WRITE then
-        log.info("BLE", "收到手机GATT写事件")
+        print("[BLE]", "收到手机GATT写事件")
         sysmsg.sendMsg(TASK_NAME, "BLE_EVENT", "WRITE_REQ", ble_param)
     elseif ble_event == ble.EVENT_ADV_START then
-        log.info("ble_server", "广播已成功启动")
+        print("[BLE]", "广播已成功启动")
     elseif ble_event == ble.EVENT_ADV_STOP then
-        log.info("ble_server", "广播已停止")
+        print("[BLE]", "广播已停止")
     end
 end
 
 -- 初始化BLE
 local function ble_init()
-    log.info("ble_server", "开始初始化BLE")
+    print("[BLE]", "开始初始化BLE")
     -- 初始化蓝牙核心
     bluetooth_device = bluetooth_device or bluetooth.init()
     if not bluetooth_device then
-        log.error("BLE", "蓝牙初始化失败")
+        print("[BLE]", "蓝牙初始化失败")
         return false
     end
 
     -- 初始化BLE功能
     ble_device = ble_device or bluetooth_device:ble(ble_event_cb)
     if not ble_device then
-        log.error("BLE", "当前固件不支持完整的BLE")
+        print("[BLE]", "当前固件不支持完整的BLE")
         return false
     end
 
     -- 创建GATT
     gatt_create = gatt_create or ble_device:gatt_create(att_db)
     if not gatt_create then
-        log.error("BLE", "BLE创建GATT失败")
+        print("[BLE]", "BLE创建GATT失败")
         return false
     end
 
@@ -412,17 +497,17 @@ local function ble_init()
         }
     })
     if not adv_create then
-        log.error("BLE", "BLE创建广播失败")
+        print("[BLE]", "BLE创建广播失败")
         return false
     end
 
     -- 开始广播
     local started = ble_device:adv_start()
     if started == false then
-        log.error("BLE", "BLE广播启动失败")
+        print("[BLE]", "BLE广播启动失败")
         return false
     end
-    log.info("ble_server", "BLE广播已启动")
+    print("[BLE]", "BLE广播已启动")
 
     return true
 end
@@ -434,13 +519,13 @@ local function ble_server_task_func()
             while true do
                 local msg = sysmsg.waitMsg(TASK_NAME, "BLE_EVENT")
                 if msg[2] == "CONNECT" then
-                    log.info("BLE", "手机已连接，等待协议连接报文")
+                    print("[BLE]", "手机已连接，等待协议连接报文")
                     sysmsg.sendMsg(ble_server_sender.TASK_NAME, "BLE_EVENT", "CONNECT_OK", ble_device)
                 elseif msg[2] == "DISCONNECTED" then
                     break
                 elseif msg[2] == "WRITE_REQ" and ble_device then
                     local param = msg[3]
-                    log.info("BLE", "处理手机写请求", param.uuid_service:toHex(), param.uuid_characteristic:toHex())
+                    print("[BLE]", "处理手机写请求", param.uuid_service:toHex(), param.uuid_characteristic:toHex())
                     ble_server_receiver.proc(param.uuid_service:toHex(), param.uuid_characteristic:toHex(), param.data)
                 end
             end

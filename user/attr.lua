@@ -499,6 +499,12 @@ end
 --
 ---换电状态
 attr.Exbat_State = false
+--- 拍拍换电等待服务器订单状态
+attr.Pp_State = false
+attr.Pp_Order = nil
+attr.Pp_BT = nil
+attr.Pp_Response = false
+attr.Pp_Direct = false
 --
 ---强制结束换电流程
 attr.End_Exbat = false

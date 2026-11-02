@@ -468,8 +468,7 @@ local function flags_reset(type,order,flag)
 end
 sys.subscribe("Flags_Reset", flags_reset)
 
---拍拍换电：逻辑为收到拍拍信号，向服务器发送9e 2c ffffff 00 01 01 fff 33请求换电，等待服务器下发0x006换电业务指令
---该函数功能为接收拍拍信号，收到信号向服务器发送请求换电的指令
+-- 拍拍信号只启动空仓入电池流程；收到服务器0x35换电订单后再进入通用换电流程。
 local function pp_signal_poll()
     local stable_level = 1
     local candidate_level = stable_level
@@ -487,10 +486,11 @@ local function pp_signal_poll()
                 triggered = false
             elseif not triggered then
                 triggered = true
-                if not attr.Exbat_State and attr.Update_Box == 0 and attr.Update_State == 0
+                if not attr.Exbat_State and not attr.Pp_State and attr.Update_Box == 0 and attr.Update_State == 0
                     and not attr.Rebat_State and not attr.Chbat_State and not attr.Qubat_State then
-                    print("[PP_EX_BAT]", "拍拍信号触发，向服务器请求换电")
-                    tcp_net.pp_request()
+                    attr.Pp_State = true
+                    sys.publish("Pp_Trigger")
+                    print("[PP_EX_BAT]", "收到拍拍信号，开始检查空仓")
                 else
                     print("[PP_EX_BAT]", "业务占用中，忽略拍拍信号")
                 end
@@ -499,6 +499,100 @@ local function pp_signal_poll()
         sys.wait(20)
     end
 end
+
+local function pp_exchange_task()
+    while true do
+        sys.waitUntil("Pp_Trigger")
+        local order
+        local boxes = attr.setup_get("BOXES") or 0
+        for i = 1, boxes do
+            if attr.Box_Lock[i] == 1 and not attr.bat_BT_get(i)
+                and (not attr.Box_Vol[i] or attr.Box_Vol[i] < 30)
+                and (not attr.Bat_Is485[i] or attr.Bat_Is485[i] == 0)
+                and attr.box_banned_get(i) == 0 and attr.box_abnor_get(i) == 0 then
+                order = i
+                break
+            end
+        end
+
+        if not order then
+            print("[PP_EX_BAT]", "没有可用空仓")
+            attr.Pp_State = false
+        else
+            attr.Pp_Order = order
+            attr.Pp_BT = nil
+            can_bus.reqbox(order, 1)
+            can_bus.locking(order)
+            print("[PP_EX_BAT]", "打开拍拍回收仓", order)
+
+            local start_time = tool.tick()
+            local opened = false
+            local finished = false
+            local closed_time
+            while not finished and tool.dur_tick(start_time) < 180000 do
+                if attr.Box_Lock[order] == 0 then opened = true end
+                if opened then
+                    local bt = attr.Bat_BT_485[order]
+                    if bt and (#bt == 24 or #bt == 26) and attr.Bat_Is485[order] == 1 then
+                        attr.Pp_BT = bt
+                        attr.bat_BT_set(order, bt)
+                        sys.publish("Analysis_Bt", order, bt)
+                        en_way[order] = 1
+                        sys.publish("UP_IND", tcp_net.Active.BatInfo, order)
+                        sys.publish("UP_IND_S", tcp_net.Active.BatInfo, order)
+                        local result, reply = sys.waitUntil("Bat_Ack", 5000)
+                        if result and reply == 0 then
+                            print("[PP_EX_BAT]", "电池信息已上传，发送0x35换电请求", order, bt)
+                            attr.Pp_Response = false
+                            tcp_net.pp_request(order, bt)
+                            local response_time = tool.tick()
+                            while attr.Pp_State and not attr.Pp_Response and tool.dur_tick(response_time) < 30000 do
+                                sys.wait(100)
+                            end
+                            if attr.Pp_State then
+                                print("[PP_EX_BAT]", "等待服务器0x35换电应答超时")
+                                attr.Pp_State = false
+                                attr.Pp_Order = nil
+                                attr.Pp_BT = nil
+                            end
+                        else
+                            print("[PP_EX_BAT]", "电池信息上传失败")
+                            attr.Pp_State = false
+                            attr.Pp_Order = nil
+                            attr.Pp_BT = nil
+                        end
+                        finished = true
+                    elseif not closed_time then
+                        closed_time = tool.tick()
+                    elseif tool.dur_tick(closed_time) > 8000 and not bt then
+                        print("[PP_EX_BAT]", "回收仓已关，未读取到有效BT码")
+                        attr.Pp_State = false
+                        attr.Pp_Order = nil
+                        finished = true
+                    end
+                end
+                sys.wait(200)
+            end
+
+            if not finished then
+                print("[PP_EX_BAT]", "等待拍拍回收仓电池超时")
+                can_bus.locking(order, true)
+                attr.Pp_State = false
+                attr.Pp_Order = nil
+                attr.Pp_BT = nil
+            end
+        end
+    end
+end
+sys.subscribe("Pp_Exchange_Result", function(ok, reason)
+    attr.Pp_Response = true
+    if not ok then
+        print("[PP_EX_BAT]", "拍拍换电未启动", reason)
+        attr.Pp_State = false
+        attr.Pp_Order = nil
+        attr.Pp_BT = nil
+    end
+end)
 
 --- 仓内电池信息更新
 local function batinfo_update_poll()
@@ -536,7 +630,7 @@ local function batinfo_update_poll()
                     else
                         mark = string.sub(bt_485,15,18)
                     end
-                    if mark == attr.setup_get("Cab_Mark") or (attr.Exbat_State and attr.exbat_info_get().orderget == i) or (attr.Rebat_State and attr.rebat_info_get().orderget == i) or (attr.Chbat_State and attr.chbat_info_get().orderget == i) then
+                    if mark == attr.setup_get("Cab_Mark") or (attr.Pp_State and attr.Pp_Order == i) or (attr.Exbat_State and attr.exbat_info_get().orderget == i) or (attr.Rebat_State and attr.rebat_info_get().orderget == i) or (attr.Chbat_State and attr.chbat_info_get().orderget == i) then
                         print("[Bat_Check]","485入仓",i)
                         analysis_bt(i,bt_485)
                         attr.bat_BT_set(i,bt_485)
@@ -1059,7 +1153,7 @@ local function bat_exchange()
         local order_give = ex_bat.ordergive               --tostring(ex_bat.ordergive)
         local lock = ex_bat.lock
         local ex_time = tool.tick()
-        local ex_state = -2
+        local ex_state = attr.Pp_Direct and 3 or -2
         local repeats = 0
         local play_state = 0
         local last_state = 0
@@ -1760,6 +1854,7 @@ local function bat_exchange()
             end
         end
         attr.Exbat_State = false
+        if not attr.exbat_info_get().flag then attr.Pp_Direct = false end
         sys.publish("UP_LCD",lcd_c.Auto.Cab_State)
         --attr.exbat_info_set(false,nil,nil,nil,nil,nil)
         -- if bu_elect_flag[order_get] then
@@ -3748,6 +3843,7 @@ local function user_init()
 
     init_flag = true 
     sys.taskInit(pp_signal_poll)
+    sys.taskInit(pp_exchange_task)
     
 end
 -- 

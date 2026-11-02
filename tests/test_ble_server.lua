@@ -39,6 +39,8 @@ string.toHex = function(s) return (s:gsub('.', function(c) return string.format(
 log = {info = function() end, warn = function() end, error = function() end}
 local tasks, queues, subscriptions = {}, {}, {}
 local ack_index = 0
+local ack_timeout
+local acks = {{1, 0}, {2, 0xFF}, {2, 2}, {3, 0}, {3, 2}, {24, 1}, {24, 2}}
 sys = {
     subscribe = function(event, cb) subscriptions[event] = cb end,
     publish = function(event, ...) if subscriptions[event] then subscriptions[event](...) end end,
@@ -51,9 +53,9 @@ sys = {
     wait = function() coroutine.yield() end,
     cleanMsg = function(name) queues[name] = {} end
 }
-sys.waitUntil = function(event)
+sys.waitUntil = function(event, timeout)
     if event ~= 'BLE_PACKET_ACK' then return false end
-    local acks = {{1, 0}, {2, 1}, {3, 1}, {24, 1}, {2, 2}, {3, 2}, {24, 2}}
+    ack_timeout = timeout
     ack_index = ack_index + 1
     local item = acks[ack_index]
     if item then return true, item[1], item[2], 0 end
@@ -130,14 +132,22 @@ assert(out[1]:byte(2) == 0 and out[1]:byte(10) == 2 and out[1]:byte(12) == 1)
 assert(out[2]:byte(11) == 15 and out[2]:byte(13) == 1)
 assert(out[2]:sub(19, 22) == string.char(9, 1, 13, 177)) -- 230.5V, 35.05A
 assert(out[3]:byte(13) == 255) -- no physical presence sensor in current project
-assert(out[5]:byte(14) == 255 and out[5]:byte(18) == 255) -- unknown 485/temperature
+assert(out[4]:byte(2) == 2 and out[4]:byte(9) == 2) -- second door is sent before any battery
 assert(out[3]:sub(15, 16) == string.char(0x1E, 0x61)) -- door voltage * 100
-assert(out[4]:byte(11) == 37 and out[4]:byte(44) == 1) -- charging status
+assert(out[5]:byte(11) == 37 and out[5]:byte(44) == 1) -- battery data follows both doors
+assert(out[4]:byte(14) == 255 and out[4]:byte(18) == 255) -- unknown 485/temperature
 assert(out[7]:sub(12, 13) == string.char(1, 2)) -- version v1.2
+assert(ack_timeout == 10000) -- allow delayed phone ACKs
 local count = #chunks
 receive(req .. req); run(); assert(#chunks == count) -- duplicate handshake
 event_cb(device, ble.EVENT_DISCONN, {reason = 0}); run()
 event_cb(device, ble.EVENT_CONN, {}); run()
 fail = true; receive(req); run(); assert(#chunks == count)
 fail = false; ack_index = 0; receive(req); run(); assert(#chunks > count) -- retry after notify failure
+event_cb(device, ble.EVENT_DISCONN, {reason = 0}); run()
+event_cb(device, ble.EVENT_CONN, {}); run()
+local before = #frames()
+ack_index = 7 -- no further ACKs: timeout on first state packet must stop the queue
+receive(req); run()
+assert(#frames() == before + 2) -- connection reply and cabinet packet only
 print('BLE protocol tests passed')
