@@ -1169,7 +1169,8 @@ local function bat_exchange()
             Ex_Flag = false
         end
         local ex_time = tool.tick()
-        local ex_state = attr.Pp_Direct and 3 or -2
+        local pp_direct = attr.Pp_Direct
+        local ex_state = pp_direct and 1 or -2
         local repeats = 0
         local play_state = 0
         local last_state = 0
@@ -1578,7 +1579,7 @@ local function bat_exchange()
                             last_state = 0
                             print("[EX_BAT]", "回收门已关闭",order_get) 
                             can_bus.lockT_clear(order_get)
-                            ex_state = 2
+                            ex_state = pp_direct and 3 or 2
                             play_state = 0
                             ex_time = tool.tick()
                         end
@@ -1613,8 +1614,12 @@ local function bat_exchange()
                         audio_c.play(CALL,"FILE",SOUND_DIR_PATH.."no_all_close.mp3",volu)
                         play_state = 2
                     elseif tool.dur_tick(ex_time) > 1000 and play_state ==0 then
-                        --语音：几号仓已开，请放入电池
-                        audio_c.play(CALL,"FILE",SOUND_DIR_PATH.."m_open_get_ok.mp3",volu)
+                        if pp_direct then
+                            audio_c.play(CALL,"FILE",SOUND_DIR_PATH.."no_all_close.mp3",volu)
+                        else
+                            --语音：几号仓已开，请放入电池
+                            audio_c.play(CALL,"FILE",SOUND_DIR_PATH.."m_open_get_ok.mp3",volu)
+                        end
                         play_state = 1
                     end
                 end
@@ -1811,10 +1816,17 @@ local function bat_exchange()
                                 "实际BT", attr.Bat_BT_485[order_give],
                                 "SOC", attr.Bat_Power[order_give])
                         end
-                        sys.publish("BLE_SWAP_STAGE", ex_bat.number, "opening_release_door")
-                        ex_state = 4
-                        ex_time = tool.tick()
-                        can_bus.locking(order_give)
+                        if pp_direct and attr.Box_Lock[order_get] ~= 1 then
+                            print("[PP_EX_BAT]", "回收仓门重新打开，等待关门", order_get)
+                            ex_state = 1
+                            last_state = 0
+                            ex_time = tool.tick()
+                        else
+                            sys.publish("BLE_SWAP_STAGE", ex_bat.number, "opening_release_door")
+                            ex_state = 4
+                            ex_time = tool.tick()
+                            can_bus.locking(order_give)
+                        end
                     end
                     --attr.Lock_Cmd = bit.bor(0x08108010,(bit.lshift(order_give,8)))
                 else
