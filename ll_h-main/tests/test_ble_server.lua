@@ -31,6 +31,7 @@ local persisted = {}
 fskv = {
     get = function(key) return persisted[key] end,
     set = function(key, value) persisted[key] = value; return true end,
+    del = function(key) persisted[key] = nil; return true end,
 }
 local tasks, queues, subscriptions, timers = {}, {}, {}, {}
 local notify_wait_ms = 0
@@ -307,7 +308,8 @@ local result_input = table.concat({'H-RESULT-v1', id, signed.order_id,
 assert(last_hmac_input == result_input)
 receive(json.encode({cmd = 'ack', id = result.id, device_id = id,
     reply_to = 'swap_result', code = 0, message = ''}) .. '\n'); run()
-assert(require('ble_swap_orders').get(signed.order_id).result_acked)
+assert(require('ble_swap_orders').get(signed.order_id) == nil)
+assert(persisted.BLESwapCurrent == nil)
 attr.Exbat_State = false
 persisted.Exbat_Info.flag = false
 signed.id = 8; signed.key_id = 'k2'

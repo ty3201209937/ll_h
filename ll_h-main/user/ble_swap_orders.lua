@@ -1,60 +1,167 @@
--- Durable BLE order records. Physical exchange remains in user.lua's Exchanging task.
+-- Keep one BLE order in fskv; user.lua executes the physical exchange.
 local M = {}
 local attr = require "attr"
 local can_bus = require "can_bus"
-local STORE_KEY = "BLESwapOrders"
-local RECORD_PREFIX = "BLESwapOrder"
-local MAX_ORDERS = 64
+local STORE_KEY = "BLESwapCurrent"
+local OLD_INDEX_KEY = "BLESwapOrders"
+local OLD_RECORD_PREFIX = "BLESwapOrder"
 local RELEASE_SAMPLE_TIMEOUT_MS = 3000
 local RETURN_SAMPLE_TIMEOUT_MS = 5000
 
-local function storage()
-    if not fskv or not fskv.get or not fskv.set then return nil end
-    local ok, value = pcall(fskv.get, STORE_KEY)
-    if not ok then return nil end
-    if value == nil then return {version = 2, list = {}} end
-    if type(value) ~= "table" or type(value.list) ~= "table" then return nil end
-    if value.version == 2 then return value end
-    if type(value.by_id) == "table" then return value end
+local function read(key)
+    local ok, value = pcall(fskv.get, key)
+    if not ok then return nil, false end
+    return value, true
 end
 
-local function save(key, data)
-    local ok, result = pcall(fskv.set, key, data)
+local function save(key, value)
+    local ok, result = pcall(fskv.set, key, value)
+    if not ok or result == false or result == nil then
+        print("[BLE] fskv写入失败", key, "返回", result, "异常", not ok)
+        if fskv.status then
+            local status_ok, used, total, count = pcall(fskv.status)
+            if status_ok then
+                print("[BLE] fskv容量", "已用", used, "总量", total, "键数", count)
+            end
+        end
+    end
     return ok and result ~= false and result ~= nil
 end
 
-local function record_key(index)
-    return RECORD_PREFIX .. tostring(index)
-end
-
-local function read_record(data, index)
-    local order_id = data.list[index]
-    if data.version ~= 2 then return data.by_id[order_id] end
-    local ok, record = pcall(fskv.get, record_key(index))
-    if ok and type(record) == "table" and record.order_id == order_id then
-        return record
+local function remove(key)
+    if not fskv.del then return false end
+    local value, read_ok = read(key)
+    if not read_ok then return false end
+    if value == nil then return true end
+    local ok, result = pcall(fskv.del, key)
+    if not ok or result == false or result == nil then
+        print("[BLE] fskv删除失败", key, "返回", result, "异常", not ok)
+        return false
     end
+    return true
 end
 
--- 先逐条写入旧订单，最后替换旧大表为索引。中途掉电仍能读取原表并重试。
-local function migrate(data)
-    if data.version == 2 then return data end
-    if #data.list > MAX_ORDERS then return nil end
-    for index, order_id in ipairs(data.list) do
-        local record = data.by_id[order_id]
-        if type(record) ~= "table" or record.order_id ~= order_id
-            or not save(record_key(index), record) then
-            print("[BLE] 旧订单迁移失败", index, order_id)
-            return nil
+-- Fixed field positions keep the single fskv value small.
+local function pack(record)
+    return {record.device_id, record.order_id, record.return_slot,
+        record.return_bt_code, record.release_slot, record.release_bt_code,
+        record.lock_if_overdue and 1 or 0, record.min_release_soc,
+        record.state, record.state_seq, record.result or 0,
+        record.result_acked and 1 or 0,
+        record.return_bt_code_read or "", record.release_bt_code_read or ""}
+end
+
+local function unpack_record(value)
+    if type(value) ~= "table" then return nil end
+    if type(value.order_id) == "string" then return value end
+    if type(value[2]) ~= "string" or type(value[10]) ~= "number" then return nil end
+    return {
+        device_id = value[1], order_id = value[2],
+        return_slot = value[3], return_bt_code = value[4],
+        release_slot = value[5], release_bt_code = value[6],
+        lock_if_overdue = value[7] == 1, min_release_soc = value[8],
+        state = value[9], state_seq = value[10],
+        result = value[11] ~= 0 and value[11] or nil,
+        result_acked = value[12] == 1,
+        return_bt_code_read = value[13] ~= "" and value[13] or nil,
+        release_bt_code_read = value[14] ~= "" and value[14] or nil,
+    }
+end
+
+local function old_record(index_data, index, order_id)
+    if index_data.version ~= 2 then
+        return unpack_record(index_data.by_id and index_data.by_id[order_id])
+    end
+    local value, ok = read(OLD_RECORD_PREFIX .. index)
+    if not ok then return nil end
+    local record = unpack_record(value)
+    return record and record.order_id == order_id and record or nil
+end
+
+local function clear_old(index_data, except_index)
+    if index_data.version == 2 then
+        for index = 1, #index_data.list do
+            if index ~= except_index and not remove(OLD_RECORD_PREFIX .. index) then
+                return false
+            end
         end
     end
-    local index_data = {version = 2, list = data.list}
-    if not save(STORE_KEY, index_data) then
-        print("[BLE] 订单索引迁移失败", #data.list)
-        return nil
+    if not except_index and not remove(OLD_INDEX_KEY) then return false end
+    return true
+end
+
+-- Migrate old multi-order storage. Preserve the executing Exbat_Info order;
+-- otherwise keep one result awaiting phone ACK.
+-- The selected old record is deleted only after the new record is written.
+local function migrate_old(index_data)
+    if type(index_data) ~= "table" or type(index_data.list) ~= "table" then
+        return nil, "old order index invalid"
     end
-    print("[BLE] 旧订单已拆分存储", #data.list)
-    return index_data
+    if index_data.version ~= 2 and type(index_data.by_id) ~= "table" then
+        return nil, "old order index invalid"
+    end
+    local active = attr.exbat_info_get and attr.exbat_info_get()
+    local chosen, chosen_index, priority = nil, nil, 0
+    for index, order_id in ipairs(index_data.list) do
+        if type(order_id) == "string" then
+            local record = old_record(index_data, index, order_id)
+            if not record then
+                if active and active.flag and active.number == order_id then
+                    return nil, "active old order unavailable"
+                end
+                print("[BLE] 旧订单记录缺失，跳过", index, order_id)
+            else
+                local rank = 0
+                if active and active.flag and active.number == order_id then rank = 3
+                elseif record.result ~= nil and not record.result_acked then rank = 1 end
+                if rank > priority then
+                    chosen, chosen_index, priority = record, index, rank
+                end
+            end
+        end
+    end
+    -- Reclaim obsolete records before writing on a nearly full device.
+    if not clear_old(index_data, chosen_index) then return nil, "old order cleanup failed" end
+    if chosen then
+        if not save(STORE_KEY, pack(chosen)) then return nil, "order migration failed" end
+        print("[BLE] 保留当前换电订单", chosen.order_id, chosen.state)
+        if not clear_old(index_data) then
+            print("[BLE] 旧订单清理待重试", chosen.order_id)
+        end
+        return chosen
+    end
+    print("[BLE] 已清理历史换电订单")
+    return nil
+end
+
+local function current()
+    if not fskv or not fskv.get or not fskv.set or not fskv.del then
+        return nil, "storage unavailable"
+    end
+    local value, ok = read(STORE_KEY)
+    if not ok then return nil, "storage unavailable" end
+    if value ~= nil then
+        local record = unpack_record(value)
+        if not record then return nil, "current order invalid" end
+        local old_index, old_ok = read(OLD_INDEX_KEY)
+        if old_ok and type(old_index) == "table"
+            and type(old_index.list) == "table" then
+            clear_old(old_index)
+        end
+        return record
+    end
+    local old_index, old_ok = read(OLD_INDEX_KEY)
+    if not old_ok then return nil, "storage unavailable" end
+    if old_index then return migrate_old(old_index) end
+    return nil
+end
+
+local function old_storage_cleared()
+    local old_index, ok = read(OLD_INDEX_KEY)
+    if not ok then return false end
+    if old_index == nil then return true end
+    if type(old_index) ~= "table" or type(old_index.list) ~= "table" then return false end
+    return clear_old(old_index)
 end
 
 local function copy(source)
@@ -67,11 +174,8 @@ local PARAMS = {"return_slot", "return_bt_code", "release_slot", "release_bt_cod
     "lock_if_overdue", "min_release_soc"}
 
 function M.get(order_id)
-    local data = storage()
-    if not data then return nil end
-    for index, id in ipairs(data.list) do
-        if id == order_id then return read_record(data, index) end
-    end
+    local record = current()
+    if record and record.order_id == order_id then return record end
 end
 
 function M.same_params(record, request)
@@ -81,7 +185,7 @@ function M.same_params(record, request)
     return true
 end
 
--- 只根据本次有效采集值判定，不用旧 SOC 或订单里的 BT 码代替实物信息。
+-- Read the release slot's door, 485 identity and SOC from a fresh CAN query.
 function M.release_ready(record)
     local slot = record.release_slot
     local soc = attr.Bat_Power and attr.Bat_Power[slot]
@@ -100,7 +204,7 @@ function M.release_ready(record)
     return ready
 end
 
--- 回收门打开前刷新本仓状态，避免持久 BT 绑定被当成当前实物。
+-- Refresh return-slot door, battery presence, BT identity and analog values.
 function M.refresh_return(record)
     local slot = record.return_slot
     local status_seq = attr.Box_Status_Seq[slot] or 0
@@ -130,7 +234,7 @@ function M.refresh_return(record)
     return false
 end
 
--- 问询仓控板并等待问询后新的状态、BT 和模拟量回包；缺任一项不放行。
+-- Refresh release-slot door, battery presence, BT identity and analog values.
 function M.refresh_release(record)
     local slot = record.release_slot
     local status_seq = attr.Box_Status_Seq[slot] or 0
@@ -159,20 +263,14 @@ function M.refresh_release(record)
     return false, "release slot fresh sample timeout"
 end
 
--- Save before driving the door state machine. Never evict an older order silently.
+-- Persist the current order before opening any door.
 function M.admit(request)
-    local data = storage()
-    if not data then return nil, "storage unavailable" end
-    for index, id in ipairs(data.list) do
-        if id == request.order_id then
-            local existing = read_record(data, index)
-            if not existing then return nil, "order record unavailable" end
-            return existing, "existing"
-        end
+    local old, err = current()
+    if err then return nil, err end
+    if old then
+        if old.order_id == request.order_id then return old, "existing" end
+        return nil, "order already active"
     end
-    if #data.list >= MAX_ORDERS then return nil, "order storage full" end
-    data = migrate(data)
-    if not data then return nil, "order migration failed" end
     local record = {
         device_id = request.device_id, order_id = request.order_id,
         return_slot = request.return_slot, return_bt_code = request.return_bt_code,
@@ -181,26 +279,19 @@ function M.admit(request)
         min_release_soc = request.min_release_soc,
         state = "accepted", state_seq = 1, result = nil, result_acked = false,
     }
-    local next_data = {version = 2, list = copy(data.list)}
-    next_data.list[#next_data.list + 1] = request.order_id
-    local index = #next_data.list
-    if not save(record_key(index), record) or not save(STORE_KEY, next_data) then
-        print("[BLE] 订单保存失败", request.order_id, "索引", index)
+    if not save(STORE_KEY, pack(record)) then
+        print("[BLE] 订单保存失败", request.order_id)
         return nil, "order persistence failed"
     end
+    print("[BLE] 当前订单已保存", request.order_id)
     return record, "new"
 end
 
--- Persist a stage change or physical result before reporting it to the phone.
+-- Persist stages and results for recovery after a restart.
 function M.update(order_id, state, result, read_return, read_release)
-    local data = storage()
-    local index, old
-    if data then
-        for i, id in ipairs(data.list) do
-            if id == order_id then index, old = i, read_record(data, i); break end
-        end
-    end
-    if not old then return nil, "order not found" end
+    local old, err = current()
+    if err then return nil, err end
+    if not old or old.order_id ~= order_id then return nil, "order not found" end
     if old.state == "completed" or old.state == "failed" then return old end
     if old.state == state and old.result == result then return old end
     local record = copy(old)
@@ -209,31 +300,28 @@ function M.update(order_id, state, result, read_return, read_release)
     record.result = result
     if read_return then record.return_bt_code_read = read_return end
     if read_release then record.release_bt_code_read = read_release end
-    if data.version ~= 2 then
-        data = migrate(data)
-        if not data then return nil, "order migration failed" end
-    end
-    if not save(record_key(index), record) then return nil, "order persistence failed" end
+    if not save(STORE_KEY, pack(record)) then return nil, "order persistence failed" end
     return record
 end
 
+-- Roll back an order when Exbat_Info cannot be saved.
+function M.cancel(order_id)
+    local record, err = current()
+    if err or not record or record.order_id ~= order_id or record.result ~= nil then return false end
+    if not old_storage_cleared() then return false end
+    return remove(STORE_KEY)
+end
+
+-- Keep the result for reconnect/query until the phone acknowledges it.
 function M.confirm(order_id)
-    local data = storage()
-    local index, old
-    if data then
-        for i, id in ipairs(data.list) do
-            if id == order_id then index, old = i, read_record(data, i); break end
-        end
+    local record, err = current()
+    if err or not record or record.order_id ~= order_id or record.result == nil then
+        return false
     end
-    if not old or old.result == nil then return false end
-    if old.result_acked then return true end
-    local record = copy(old)
-    record.result_acked = true
-    if data.version ~= 2 then
-        data = migrate(data)
-        if not data then return false end
-    end
-    return save(record_key(index), record)
+    if not old_storage_cleared() then return false end
+    if not remove(STORE_KEY) then return false end
+    print("[BLE] 订单结果已确认，清空当前订单", order_id)
+    return true
 end
 
 return M

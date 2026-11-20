@@ -454,7 +454,7 @@ local function send_state(order_id, order, query_id)
     }, {critical = true, priority = true})
 end
 
--- 发送已持久化的终态；手机保存后回 ACK，断线前未确认可通过 swap_query 补发。
+-- 发送已持久化的终态；手机 ACK 后清空当前订单，未确认可通过 swap_query 补发。
 local function send_result(order)
     if not order or order.result == nil then return end
     local key_id, sig = signature.sign_result(order)
@@ -470,7 +470,7 @@ local function send_result(order)
         key_id = key_id, sig = sig,
     }, {critical = true, priority = true, on_ack = function()
         if not orders.confirm(order.order_id) then
-            print("[BLE] 换电结果确认保存失败", order.order_id)
+            print("[BLE] 换电结果确认后清理订单失败", order.order_id)
         end
     end})
 end
@@ -571,7 +571,9 @@ local function handle_swap(message)
     local read_ok, persisted = pcall(fskv.get, "Exbat_Info")
     if not ok or not read_ok or type(persisted) ~= "table" or persisted.number ~= message.order_id
         or persisted.orderget ~= message.return_slot or persisted.ordergive ~= message.release_slot then
-        orders.update(message.order_id, "recovery_required")
+        if not orders.cancel(message.order_id) then
+            print("[BLE] 旧换电订单保存失败后，BLE订单清理失败", message.order_id)
+        end
         return 5, "legacy order persistence failed"
     end
     -- 先占用柜机，防止 TCP 在 Exchanging 任务真正运行前接入另一订单。
